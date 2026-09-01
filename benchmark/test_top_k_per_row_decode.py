@@ -17,6 +17,11 @@
 Shapes match DeepSeek V4 production config (vocab=129280, top_k=1024).
 The baseline uses vLLM's CUDA kernel when available,
 falling back to a pure-PyTorch reference (torch.topk).
+
+Latency is measured via CUDA graph capture + replay (see
+TopKPerRowDecodeBenchmark.get_latency): the kernel is captured once and the
+graph is replayed under CUDA-event timing, which removes host launch overhead
+and matches how the op runs inside vLLM (piecewise CUDA graphs).
 """
 
 import inspect
@@ -52,14 +57,7 @@ try:
         logits, next_n, seq_lens, indices, num_rows, stride0, stride1, top_k
     ):
         torch.ops._C.top_k_per_row_decode(
-            logits,
-            next_n,
-            seq_lens,
-            indices,
-            num_rows,
-            stride0,
-            stride1,
-            top_k,
+            logits, next_n, seq_lens, indices, num_rows, stride0, stride1, top_k
         )
 
     HAS_VLLM = True
@@ -68,43 +66,73 @@ except (ImportError, AttributeError):
     _vllm_top_k_per_row_decode = None
 
 
-def _torch_topk_ref(
-    logits, next_n, seq_lens, indices, num_rows, stride0, stride1, top_k
-):
-    """Pure-PyTorch fallback reference using torch.topk."""
-    seq_len = seq_lens[0].item()
-    valid_logits = logits[:, :seq_len]
-    _, top_idx = torch.topk(valid_logits, top_k, dim=1, largest=True, sorted=False)
-    indices.copy_(top_idx.to(torch.int32))
-
-
-_baseline_op = _vllm_top_k_per_row_decode if HAS_VLLM else _torch_topk_ref
-
-
 class TopKPerRowDecodeBenchmark(base.Benchmark):
-    DEFAULT_SHAPE_DESC = "vocab_size, top_k"
+    DEFAULT_SHAPE_DESC = "num_rows, vocab_size, next_n, top_k, stride0, stride1"
+
+    def get_latency(self, op, *args, **kwargs):
+        """Measure latency via CUDA graph capture + replay.
+
+        Warmup runs on a side stream so Triton JIT compilation / config
+        selection completes before capture. Only device-side work is recorded
+        in the graph, so replay timing excludes host launch overhead and
+        matches how the op runs inside vLLM (piecewise CUDA graphs).
+        """
+        fn = lambda: op(*args, **kwargs)  # noqa: E731
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(base.Config.warm_up):
+                fn()
+        torch.cuda.current_stream().wait_stream(stream)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            fn()
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(base.Config.repetition):
+            graph.replay()
+        end.record()
+        torch.cuda.synchronize()
+        # average latency in ms
+        return start.elapsed_time(end) / base.Config.repetition
 
     def set_shapes(self, shape_file_path=None):
         self.shapes = [
-            (129280, 1024),
-            (32768, 512),
-            (16384, 256),
-            (8192, 128),
-            (4096, 64),
+            # DeepSeek-V4-Flash
+            (1, 262144, 1, 512, 262144, 1),
+            (496, 262144, 1, 512, 262144, 1),
+            (512, 262144, 1, 512, 262144, 1),
+            (16, 262144, 1, 512, 262144, 1),
+            (32, 262144, 1, 512, 262144, 1),
+            (48, 262144, 1, 512, 262144, 1),
+            (40, 262144, 1, 512, 262144, 1),
+            (56, 262144, 1, 512, 262144, 1),
+            (4, 262144, 1, 512, 262144, 1),
+            (8, 262144, 1, 512, 262144, 1),
+            (24, 262144, 1, 512, 262144, 1),
         ]
 
     def get_input_iter(self, dtype):
-        for vocab_size, top_k in self.shapes:
+        for num_rows, vocab_size, next_n, top_k, stride0, stride1 in self.shapes:
             torch.manual_seed(42)
-            logits = torch.randn(
-                (1, vocab_size), dtype=torch.float32, device=self.device
+            buf = torch.randn(
+                (num_rows - 1) * stride0 + (vocab_size - 1) * stride1 + 1,
+                device=self.device,
+                dtype=torch.float32,
             )
-            seq_lens = torch.tensor([vocab_size], dtype=torch.int32, device=self.device)
-            indices = torch.zeros((1, top_k), dtype=torch.int32, device=self.device)
-            num_rows = 1
-            next_n = 1
-            stride0 = logits.stride(0)
-            stride1 = logits.stride(1)
+            logits = torch.as_strided(buf, (num_rows, vocab_size), (stride0, stride1))
+
+            batch_size = num_rows // next_n
+            seq_lens = torch.full(
+                (batch_size,), vocab_size, dtype=torch.int32, device=self.device
+            )
+            indices = torch.zeros(
+                (num_rows, top_k), dtype=torch.int32, device=self.device
+            )
 
             yield (
                 logits,
@@ -119,10 +147,11 @@ class TopKPerRowDecodeBenchmark(base.Benchmark):
 
 
 @pytest.mark.top_k_per_row_decode
+@pytest.mark.skipif(not HAS_VLLM, reason="vLLM not installed")
 def test_top_k_per_row_decode():
     bench = TopKPerRowDecodeBenchmark(
         op_name="top_k_per_row_decode",
-        torch_op=_baseline_op,
+        torch_op=_vllm_top_k_per_row_decode,
         gems_op=top_k_per_row_decode,
         dtypes=[torch.float32],
     )
